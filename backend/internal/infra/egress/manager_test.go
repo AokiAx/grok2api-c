@@ -79,17 +79,90 @@ func TestBrowserRequestLeavesHeaderOrderingToTLSProfile(t *testing.T) {
 	}
 }
 
-func TestConfiguredCoolingAppNodesNeverFallBackToDirect(t *testing.T) {
+func TestConfiguredCoolingNodesStayOnProxyWithoutDirectFallback(t *testing.T) {
 	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encryptedProxy, err := cipher.Encrypt("socks5h://warp:1080")
 	if err != nil {
 		t.Fatal(err)
 	}
 	until := time.Now().Add(time.Minute)
 	manager := NewManager(egressRepositoryTestStub{nodes: []domain.Node{{
-		ID: 1, Name: "proxy", Scope: domain.ScopeWeb, Enabled: true, CooldownUntil: &until,
+		ID: 1, Name: "warp", Scope: domain.ScopeWeb, Enabled: true, Health: 0.2,
+		EncryptedProxyURL: encryptedProxy, CooldownUntil: &until,
 	}}}, cipher)
-	if _, err := manager.Acquire(context.Background(), domain.ScopeWeb, "account"); err == nil {
-		t.Fatal("cooling configured node unexpectedly fell back to direct")
+	lease, err := manager.Acquire(context.Background(), domain.ScopeWeb, "account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.NodeID != 1 || lease.NodeName != "warp" || lease.ProxyURL != "socks5h://warp:1080" {
+		t.Fatalf("cooling sole node should stay on proxy, got %#v", lease)
+	}
+}
+
+func TestReadyPeerPreferredOverCoolingNode(t *testing.T) {
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	coolingProxy, err := cipher.Encrypt("socks5h://cooling:1080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	readyProxy, err := cipher.Encrypt("socks5h://ready:1080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	until := time.Now().Add(time.Minute)
+	manager := NewManager(egressRepositoryTestStub{nodes: []domain.Node{
+		{ID: 1, Name: "cooling", Scope: domain.ScopeWeb, Enabled: true, Health: 1, EncryptedProxyURL: coolingProxy, CooldownUntil: &until},
+		{ID: 2, Name: "ready", Scope: domain.ScopeWeb, Enabled: true, Health: 0.5, EncryptedProxyURL: readyProxy},
+	}}, cipher)
+	lease, err := manager.Acquire(context.Background(), domain.ScopeWeb, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.NodeID != 2 || lease.ProxyURL != "socks5h://ready:1080" {
+		t.Fatalf("expected ready peer, got %#v", lease)
+	}
+}
+
+func TestSoleEnabledNodeTransportErrorSkipsHardCooldown(t *testing.T) {
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := &mutableEgressRepository{node: domain.Node{
+		ID: 1, Name: "warp", Scope: domain.ScopeWeb, Enabled: true, Health: 1,
+	}}
+	manager := NewManager(repository, cipher)
+	manager.Feedback(context.Background(), 1, 0, errors.New("proxyconnect tcp: connection refused"))
+	if repository.updates != 1 || repository.node.CooldownUntil != nil || repository.node.LastError != "transport error" || repository.node.Health >= 1 {
+		t.Fatalf("sole node hard-cooled: %#v updates=%d", repository.node, repository.updates)
+	}
+}
+
+func TestMultiNodeTransportErrorStillCoolsFailedPeer(t *testing.T) {
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := &mutableMultiEgressRepository{nodes: []domain.Node{
+		{ID: 1, Name: "a", Scope: domain.ScopeWeb, Enabled: true, Health: 1},
+		{ID: 2, Name: "b", Scope: domain.ScopeWeb, Enabled: true, Health: 1},
+	}}
+	manager := NewManager(repository, cipher)
+	manager.Feedback(context.Background(), 1, 0, errors.New("proxyconnect tcp: connection refused"))
+	node, err := repository.GetEgressNode(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node.CooldownUntil == nil || node.LastError != "transport error" {
+		t.Fatalf("multi-node peer should cool down: %#v", node)
 	}
 }
 
@@ -464,6 +537,56 @@ func (r *mutableEgressRepository) DeleteEgressNode(_ context.Context, id uint64)
 	}
 	r.node = domain.Node{}
 	return nil
+}
+
+type mutableMultiEgressRepository struct {
+	nodes   []domain.Node
+	updates int
+}
+
+func (r *mutableMultiEgressRepository) ListEgressNodes(_ context.Context, scope domain.Scope, _ repository.SortQuery) ([]domain.Node, error) {
+	values := make([]domain.Node, 0, len(r.nodes))
+	for _, node := range r.nodes {
+		if scope == "" || node.Scope == scope {
+			values = append(values, node)
+		}
+	}
+	return values, nil
+}
+
+func (r *mutableMultiEgressRepository) GetEgressNode(_ context.Context, id uint64) (domain.Node, error) {
+	for _, node := range r.nodes {
+		if node.ID == id {
+			return node, nil
+		}
+	}
+	return domain.Node{}, errors.New("not found")
+}
+
+func (r *mutableMultiEgressRepository) CreateEgressNode(_ context.Context, value domain.Node) (domain.Node, error) {
+	r.nodes = append(r.nodes, value)
+	return value, nil
+}
+
+func (r *mutableMultiEgressRepository) UpdateEgressNode(_ context.Context, value domain.Node) (domain.Node, error) {
+	for index, node := range r.nodes {
+		if node.ID == value.ID {
+			r.nodes[index] = value
+			r.updates++
+			return value, nil
+		}
+	}
+	return domain.Node{}, errors.New("not found")
+}
+
+func (r *mutableMultiEgressRepository) DeleteEgressNode(_ context.Context, id uint64) error {
+	for index, node := range r.nodes {
+		if node.ID == id {
+			r.nodes = append(r.nodes[:index], r.nodes[index+1:]...)
+			return nil
+		}
+	}
+	return errors.New("not found")
 }
 
 func (r *countingEgressRepository) ListEgressNodes(ctx context.Context, scope domain.Scope, sort repository.SortQuery) ([]domain.Node, error) {

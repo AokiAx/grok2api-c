@@ -128,6 +128,7 @@ func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity stri
 	now := time.Now().UTC()
 	configured := false
 	var available []domain.Node
+	var degraded []domain.Node
 	for _, candidateScope := range fallbackScopes(scope) {
 		nodes, err := m.listNodes(ctx, candidateScope, now)
 		if err != nil {
@@ -135,25 +136,40 @@ func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity stri
 		}
 		configured = configured || len(nodes) > 0
 		candidateAvailable := make([]domain.Node, 0, len(nodes))
+		candidateDegraded := make([]domain.Node, 0, len(nodes))
 		for _, node := range nodes {
-			if node.Enabled && (node.CooldownUntil == nil || !now.Before(*node.CooldownUntil)) {
-				candidateAvailable = append(candidateAvailable, node)
+			if !node.Enabled {
+				continue
 			}
+			// Cool-down only deprioritizes a node; a sole WARP/proxy exit must
+			// remain usable so a transient blip does not hard-block the scope.
+			if node.CooldownUntil != nil && now.Before(*node.CooldownUntil) {
+				candidateDegraded = append(candidateDegraded, node)
+				continue
+			}
+			candidateAvailable = append(candidateAvailable, node)
 		}
 		if len(candidateAvailable) > 0 {
 			available = candidateAvailable
 			break
 		}
+		if len(candidateDegraded) > 0 && len(degraded) == 0 {
+			degraded = candidateDegraded
+		}
 	}
 	if len(available) == 0 {
-		if configured {
+		if len(degraded) > 0 {
+			// Prefer any still-enabled cooling node over direct. Direct would
+			// leak the host IP when the operator intentionally configured egress.
+			available = degraded
+		} else if configured {
 			return nil, false, fmt.Errorf("当前没有可用的 %s 出口节点", scope)
-		}
-		if !allowDirect {
+		} else if !allowDirect {
 			recordSelection(ctx, Selection{NodeName: "direct", Scope: scope})
 			return nil, false, nil
+		} else {
+			available = []domain.Node{{ID: 0, Name: "direct", Scope: scope, Enabled: true, Health: 1}}
 		}
-		available = []domain.Node{{ID: 0, Name: "direct", Scope: scope, Enabled: true, Health: 1}}
 	}
 	sort.SliceStable(available, func(i, j int) bool { return available[i].ID < available[j].ID })
 	selected := m.selectNode(available, affinity)
@@ -304,7 +320,7 @@ func (m *Manager) selectNode(nodes []domain.Node, affinity string) domain.Node {
 			return selected
 		}
 		for _, node := range nodes {
-			if node.Health > selected.Health {
+			if nodePreferable(node, selected) {
 				selected = node
 			}
 		}
@@ -314,11 +330,30 @@ func (m *Manager) selectNode(nodes []domain.Node, affinity string) domain.Node {
 	defer m.mu.Unlock()
 	best := nodes[0]
 	for _, node := range nodes[1:] {
-		if m.inflight[node.ID] < m.inflight[best.ID] || (m.inflight[node.ID] == m.inflight[best.ID] && node.Health > best.Health) {
+		if m.inflight[node.ID] < m.inflight[best.ID] || (m.inflight[node.ID] == m.inflight[best.ID] && nodePreferable(node, best)) {
 			best = node
 		}
 	}
 	return best
+}
+
+// nodePreferable ranks healthier nodes first; on a tie, the one leaving cool-down
+// sooner wins so multi-node pools recover faster without hard-failing traffic.
+func nodePreferable(candidate, current domain.Node) bool {
+	if candidate.Health > current.Health {
+		return true
+	}
+	if candidate.Health < current.Health {
+		return false
+	}
+	return cooldownRank(candidate.CooldownUntil) < cooldownRank(current.CooldownUntil)
+}
+
+func cooldownRank(until *time.Time) int64 {
+	if until == nil {
+		return 0
+	}
+	return until.UnixNano()
 }
 
 func (m *Manager) clientFor(id uint64, scope domain.Scope, proxyURL, userAgent, cookies string, sticky bool) (cachedClient, error) {
@@ -421,9 +456,17 @@ func (m *Manager) FeedbackForScope(ctx context.Context, scope domain.Scope, node
 	default:
 		value.FailureCount++
 		value.Health = max(0.05, value.Health*0.7)
-		cooldown := min(10*time.Minute, 30*time.Second*time.Duration(1<<min(value.FailureCount-1, 4)))
-		until := now.Add(cooldown)
-		value.CooldownUntil = &until
+		// Sole enabled nodes (typical single WARP setup) must not enter a hard
+		// cool-down window: there is no peer to fail over to, and acquire will
+		// already reuse cooling nodes as a last resort. Multi-node pools keep
+		// exponential cool-down so healthy peers are preferred.
+		if !m.isSoleEnabledNode(ctx, value) {
+			cooldown := min(10*time.Minute, 30*time.Second*time.Duration(1<<min(value.FailureCount-1, 4)))
+			until := now.Add(cooldown)
+			value.CooldownUntil = &until
+		} else {
+			value.CooldownUntil = nil
+		}
 		if transportErr != nil {
 			value.LastError = "transport error"
 		} else {
@@ -436,6 +479,28 @@ func (m *Manager) FeedbackForScope(ctx context.Context, scope domain.Scope, node
 	if _, err := m.repository.UpdateEgressNode(ctx, value); err == nil {
 		m.invalidateNodes(value.Scope)
 	}
+}
+
+func (m *Manager) isSoleEnabledNode(ctx context.Context, value domain.Node) bool {
+	if m == nil || m.repository == nil {
+		return true
+	}
+	nodes, err := m.repository.ListEgressNodes(ctx, value.Scope, repository.SortQuery{})
+	if err != nil {
+		// Fail open for single-exit deployments: avoid hard cool-down when we
+		// cannot confirm peer nodes exist.
+		return true
+	}
+	enabled := 0
+	for _, node := range nodes {
+		if node.Enabled {
+			enabled++
+			if enabled > 1 {
+				return false
+			}
+		}
+	}
+	return enabled <= 1
 }
 
 func (m *Manager) isStickyProxyNode(value domain.Node) bool {
