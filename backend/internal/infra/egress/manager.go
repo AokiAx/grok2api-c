@@ -134,13 +134,16 @@ func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity stri
 		if err != nil {
 			return nil, false, err
 		}
-		configured = configured || len(nodes) > 0
 		candidateAvailable := make([]domain.Node, 0, len(nodes))
 		candidateDegraded := make([]domain.Node, 0, len(nodes))
 		for _, node := range nodes {
 			if !node.Enabled {
 				continue
 			}
+			// Only enabled nodes count as "configured". Fully disabled pools may
+			// fall back to direct so operators can turn proxies off without
+			// hard-blocking the scope.
+			configured = true
 			// Cool-down only deprioritizes a node; a sole WARP/proxy exit must
 			// remain usable so a transient blip does not hard-block the scope.
 			if node.CooldownUntil != nil && now.Before(*node.CooldownUntil) {
